@@ -266,8 +266,49 @@ The server provides public API endpoints for management. The webhook endpoint is
 **OpenAPI Specification:** See [`openapi.yaml`](./openapi.yaml) for complete API documentation with request/response schemas, authentication details, and examples.
 
 **Key Endpoints:**
-- `GET /health` - Health check (public)  
+- `GET /health` - Health check (public)
 - `GET /api/pubkey` - SSH public key retrieval (public)
 - `GET /docs` - Interactive API documentation (public)
 - `GET /openapi.yaml` - OpenAPI specification (public)
 - `POST /webhooks` - Optional webhook ingestion, mounted only when `WEBHOOK_SECRET` is set
+
+## Read-only vault snapshots for PD Notes
+
+`snapshot_export.py` consumes Relay's actual folder Yjs manifest, text/canvas Yjs
+updates and hashed attachment downloads. It never calls a Relay write API and
+never runs Git commits or pushes. Native attachment paths, including HTML, stay
+inside their configured shared-folder prefix.
+
+Create a non-secret JSON plan mapping only the published shared folders:
+
+```json
+{"server_url":"https://relay.example.internal","relay_id":"RELAY_UUID","folders":[{"id":"FOLDER_UUID","prefix":"eng-relay"}]}
+```
+
+Use the existing authorized credential in `RELAY_SERVER_API_KEY`, provided by
+secret injection; do not put it in the plan, command arguments or a URL. Run:
+
+```bash
+uv run python snapshot_export.py --config /path/to/plan.json --root /path/to/relay-snapshots --interval 10
+```
+
+The app observes `current.json`. Complete immutable snapshots live under
+`generations/<revision>/`; no `assets/` tree is created. A revision is a digest of
+native paths and content hashes. Protected snapshots are retained for rollback.
+Pending documents, pending/bad-checksum attachments, changed folder membership,
+and transport failures leave `current.json` intact. Rename converges with the
+same resource identity. Deletion requires two consecutive successful observations;
+a wholly empty map and mass deletion/truncation bursts defer publication for
+operator review. There is deliberately no override bypass in this first version.
+
+This is reconciliation polling, not a WebSocket subscription. Each pass fetches
+all bodies. A stable membership check is not a transaction across concurrently
+edited documents; the next pass catches later body changes. Before production,
+prove read-only authorization, select the published folder plan, add event/head
+subscriptions, select accepted-pin storage/pruning policy, validate the real volume
+and package/deploy the companion privately. A fixture protocol test proves export transport and Yjs
+compatibility; it does not prove permission to read the production vault.
+
+```bash
+uv run pytest tests/test_snapshot_export.py tests/test_relay_client.py tests/test_relay_sdk.py
+```
