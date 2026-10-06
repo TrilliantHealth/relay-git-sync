@@ -22,6 +22,7 @@ from pathlib import Path, PurePosixPath
 from models import create_document_resource_from_metadata
 from relay_client import RelayClient
 from s3rn import S3RemoteCanvas, S3RemoteDocument, S3RemoteFolder
+from snapshot_budget import StorageBudget, StorageRefused
 
 
 class DeferredExport(RuntimeError):
@@ -64,7 +65,7 @@ def revision_name(value):
 
 
 class SnapshotExporter:
-    def __init__(self, client, relay_id, folders, root, retain=3):
+    def __init__(self, client, relay_id, folders, root, retain=3, budget=None):
         self.client = client
         self.relay_id = relay_id
         self.folders = folders
@@ -73,6 +74,7 @@ class SnapshotExporter:
         if retain < 1:
             raise ValueError("retain must be positive")
         self.retain = retain
+        self.budget = budget
         self.plan = hashlib.sha256(
             json.dumps([relay_id, folders], sort_keys=True).encode()
         ).hexdigest()
@@ -87,6 +89,7 @@ class SnapshotExporter:
         with (self.root / "export.lock").open("w") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             self._recover_storage()
+            self._admit_storage({})
             receipt = self._export_locked()
             try:
                 self._retain_generations()
@@ -98,6 +101,10 @@ class SnapshotExporter:
                     flush=True,
                 )
             return receipt
+
+    def _admit_storage(self, files, metadata_bytes=4096):
+        if self.budget is not None:
+            self.budget.admit(self.root, files, metadata_bytes)
 
     def _export_locked(self):
         state_path = self.root / "state.json"
@@ -150,6 +157,10 @@ class SnapshotExporter:
         threshold = max(int(len(previous) * 0.1), 25)
         if len(removed) > threshold or truncated > threshold:
             raise DeferredExport("mass deletion or truncation requires review")
+        metadata_bytes = (
+            len(json.dumps({"plan": self.plan, "membership": membership}).encode()) + 4096
+        )
+        self._admit_storage({}, metadata_bytes)
         if removed and state.get("pending_removed") != removed:
             atomic_json(state_path, {**state, "plan": self.plan, "pending_removed": removed})
             raise DeferredExport("deletions await a second successful observation")
@@ -159,6 +170,7 @@ class SnapshotExporter:
         revision = digest.hexdigest()
         generation = self.root / "generations" / revision
         if not generation.exists():
+            self._admit_storage(files, metadata_bytes)
             staging = self.root / ("staging-" + uuid.uuid4().hex)
             staging.mkdir()
             try:
@@ -166,6 +178,8 @@ class SnapshotExporter:
                     destination = staging / path
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     with destination.open("wb") as handle:
+                        if self.budget is not None:
+                            self.budget.before_write(self.root, {path: content}, metadata_bytes)
                         handle.write(content)
                         handle.flush()
                         os.fsync(handle.fileno())
@@ -182,6 +196,7 @@ class SnapshotExporter:
             "content_dir": str(generation),
             "files": len(files),
         }
+        self._admit_storage({}, metadata_bytes)
         atomic_json(state_path, {"plan": self.plan, "membership": membership})
         atomic_json(self.root / "current.json", receipt)
         return receipt
@@ -302,13 +317,36 @@ def main():
         default=3,
         help="Keep N newest generations plus every app pin and source receipt",
     )
+    parser.add_argument(
+        "--budget-bytes",
+        type=int,
+        required=True,
+        help="Allocated-byte ceiling for the entire private snapshot root",
+    )
+    parser.add_argument(
+        "--reserve-bytes",
+        type=int,
+        required=True,
+        help="Keep this many bytes beyond estimated staging and metadata",
+    )
+    parser.add_argument(
+        "--reserve-inodes",
+        type=int,
+        required=True,
+        help="Keep this many available filesystem inodes beyond staging",
+    )
     args = parser.parse_args()
     logging.disable(logging.CRITICAL)
     try:
         config = json.loads(args.config.read_text())
         client = RelayClient(config["server_url"], os.environ.get("RELAY_SERVER_API_KEY"))
         exporter = SnapshotExporter(
-            client, config["relay_id"], config["folders"], args.root, args.retain
+            client,
+            config["relay_id"],
+            config["folders"],
+            args.root,
+            args.retain,
+            StorageBudget(args.budget_bytes, args.reserve_bytes, args.reserve_inodes),
         )
         stopped = threading.Event()
         signal.signal(signal.SIGTERM, lambda *_args: stopped.set())
@@ -322,7 +360,15 @@ def main():
                 if not args.interval:
                     raise
                 print(
-                    json.dumps({"error": "export deferred", "kind": type(error).__name__}),
+                    json.dumps(
+                        {
+                            "error": "export deferred",
+                            "kind": type(error).__name__,
+                            "freshness": "frozen"
+                            if isinstance(error, StorageRefused)
+                            else "deferred",
+                        }
+                    ),
                     file=sys.stderr,
                     flush=True,
                 )
@@ -332,7 +378,13 @@ def main():
         return 0
     except Exception as error:
         print(
-            json.dumps({"error": "export deferred", "kind": type(error).__name__}),
+            json.dumps(
+                {
+                    "error": "export deferred",
+                    "kind": type(error).__name__,
+                    "freshness": "frozen" if isinstance(error, StorageRefused) else "deferred",
+                }
+            ),
             file=sys.stderr,
         )
         return 1

@@ -54,6 +54,7 @@ py-modules = [
     "s3rn",
     "sync_engine",
     "snapshot_export",
+    "snapshot_budget",
     "web_server",
     "webhook_handler",
     "websocket_listener",

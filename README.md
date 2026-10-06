@@ -289,7 +289,9 @@ Use the existing authorized credential in `RELAY_SERVER_API_KEY`, provided by
 secret injection; do not put it in the plan, command arguments or a URL. Run:
 
 ```bash
-uv run python snapshot_export.py --config /path/to/plan.json --root /path/to/relay-snapshots --interval 10
+uv run python snapshot_export.py --config /path/to/plan.json --root /path/to/relay-snapshots --interval 10 \
+  --budget-bytes "$RELAY_SNAPSHOT_BUDGET_BYTES" --reserve-bytes "$RELAY_SNAPSHOT_RESERVE_BYTES" \
+  --reserve-inodes "$RELAY_SNAPSHOT_RESERVE_INODES"
 ```
 
 The app observes `current.json`. Complete immutable snapshots live under
@@ -312,3 +314,108 @@ compatibility; it does not prove permission to read the production vault.
 ```bash
 uv run pytest tests/test_snapshot_export.py tests/test_relay_client.py tests/test_relay_sdk.py
 ```
+
+
+### Locked companion lifecycle and storage
+
+`uv sync --frozen` installs the `relay-snapshot-export` console command. The local
+`scripts/run-snapshot-export.sh` uses the locked environment without dev dependencies:
+
+```bash
+export RELAY_SNAPSHOT_PLAN=/private/config/published-folders.json
+export VAULT_RELAY_ROOT=/private/data/relay-snapshots
+# Set RELAY_SNAPSHOT_BUDGET_BYTES, RELAY_SNAPSHOT_RESERVE_BYTES and
+# RELAY_SNAPSHOT_RESERVE_INODES to measured/approved positive values.
+# Inject RELAY_SERVER_API_KEY through the existing authorized secret mechanism.
+./scripts/run-snapshot-export.sh
+```
+
+`RELAY_SNAPSHOT_INTERVAL` defaults to 10 seconds and `RELAY_SNAPSHOT_RETAIN` to 3.
+SIGTERM/SIGINT completes the current export, then stops; an in-flight network call
+can delay shutdown until its SDK timeout. A process manager can enforce its shutdown
+budget. This entry point starts only the read-only exporter, with no Git writer,
+HTTP service, or credential generator. The PD Notes app's `scripts/run-relay-local.py`
+supervises the local app/exporter pair; see its `docs/relay-live.md` for isolated
+configuration, port ownership, secret separation and process-group cleanup.
+
+Retention keeps N newest generations plus `current.json`, `served.json`,
+`served.previous.json` and every `pins/<revision>`. The app pins before it can read a
+generation and verifies that its original directory exists. Cleanup quarantines a
+candidate, rechecks protection and restores a generation whose pin won the race.
+Restart restores interrupted quarantine and removes incomplete staging under the
+export lock. Invalid protection records defer retention. Existing generations are
+verified byte-for-byte before reuse. Source file writes and JSON replacements are
+synced; filesystem/host-power-loss semantics still need production-volume testing.
+
+App pins are permanent and deliberately never age out while readers may exist.
+Retention bounds only unpinned history, not total storage. Failed reload candidates
+can also remain pinned. Pin pruning must
+happen offline with all app/exporter processes stopped; preserve the three receipt
+revisions and reconcile a pending publication first. Bounded online accepted-history
+cleanup requires cross-process lease proof. No symlink generation is exported or
+pruned. Native note directories remain separate from Git backup/history directories.
+
+Tests cover interrupted staging/quarantine, restart after body/state/receipt write
+failures, incomplete generation reuse, malformed app protection receipts, and a pin
+racing quarantine. They inject disk errors without filling the real host disk.
+
+
+### Dedicated companion packaging
+
+`Dockerfile.snapshot` has a `runtime` target whose entrypoint is the installed
+`relay-snapshot-export`, running as UID/GID65534. Mount the private snapshot root
+writable by that UID and mount the folder plan read-only outside it. It contains
+frozen no-dev runtime dependencies and the installed wheel, with no Git/webhook
+service launcher. `Dockerfile` remains the backup service image.
+
+The `smoke` target runs the real installed entrypoint against loopback Yjs and a
+native HTML attachment, with a synthetic credential. It checks GET-only export,
+outage/refusal preservation and secret suppression; it does not contact Relay.
+The scoped snapshot workflow runs regressions, wheel checks and that container
+smoke on PRs/manual dispatch, with read-only GitHub permissions and no deployment.
+
+```bash
+uv sync --frozen
+uv run --frozen pytest
+uv build --wheel
+uv run --frozen python scripts/check-snapshot-wheel.py
+uv run --frozen python scripts/snapshot-smoke.py
+docker build -f Dockerfile.snapshot --target smoke -t relay-snapshot-smoke .
+docker build -f Dockerfile.snapshot --target runtime -t relay-snapshot-runtime .
+```
+
+The default Python3.10-slim image follows this repository's runtime convention;
+uv0.12.3 matches local locked-environment verification. Production owners must
+approve and supply an immutable `PYTHON_IMAGE` digest and the built artifact digest.
+No digest is invented or automatically deployed. Container/native-wheel behavior
+must pass on the intended Linux architecture, with a read-only root filesystem and
+appropriately owned writable snapshot mount.
+
+### Conservative storage admission
+
+Every console/launcher invocation requires an explicit `--budget-bytes`,
+`--reserve-bytes`, and `--reserve-inodes`. Library callers may omit `budget` for
+existing backup/test integrations; that does not establish production protection.
+The budget counts actual allocated blocks throughout the private root, including
+pinned/attempted history, receipts and staging. Before staging it adds a dense
+allocation estimate for every incoming body, directories and JSON replacements;
+while writing it rechecks filesystem free bytes/inodes and before publication it
+recounts actual root allocation. Sparse files are estimated densely. Zero/missing filesystem
+inode availability refuses, rather than pretending it is measured.
+
+Refusal emits `StorageRefused` with `freshness: frozen`, cleans partial staging and
+preserves last-good current/served receipts and pins. Increasing an approved budget
+or restoring reserved capacity permits retry, including a fresh exporter process.
+The admission policy never deletes a pin to make room. It may conservatively
+refuse an unchanged export when its metadata reserve cannot be established.
+
+Set the allocation limit below an enforced **dedicated filesystem quota**, retaining
+separate safety reserves sized from representative allocated generation growth,
+filesystem metadata and app journal/pin needs. These checks cannot reserve space
+against arbitrary other writers; app/search/Git caches must have separate limits
+and volumes. Shared-volume app writes can race checks. Filesystem block estimates
+and concurrent-write semantics need validation on the intended volume. The full
+remote bodies still occupy memory during reconciliation; RAM/timeout limits and
+large real-asset growth remain rollout checks. Refusal freezes freshness and must
+alert an operator; it does not prove a lag SLO. Retention still bounds only unpinned
+history; permanent reader pins remain protected. See [offline maintenance](docs/snapshot-maintenance.md).

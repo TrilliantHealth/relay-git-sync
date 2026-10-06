@@ -21,3 +21,6 @@ state
 tests
 test_*.py
 trigger_*.py
+
+dist
+*.egg-info
