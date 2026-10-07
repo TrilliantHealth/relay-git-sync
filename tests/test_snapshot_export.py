@@ -18,6 +18,77 @@ RELAY = "11111111-1111-1111-1111-111111111111"
 FOLDER = "22222222-2222-2222-2222-222222222222"
 NOTE = "33333333-3333-3333-3333-333333333333"
 FILE = "44444444-4444-4444-4444-444444444444"
+CANVAS = "55555555-5555-5555-5555-555555555555"
+
+
+class CanvasSDK:
+    def __init__(self, canvas):
+        self.canvas = canvas
+        self.canvas_reads = 0
+
+    def get_doc_as_update(self, identifier):
+        if identifier.endswith(FOLDER):
+            return Doc(
+                {"filemeta_v0": Map({"/diagram.canvas": {"id": CANVAS, "type": "canvas"}})}
+            ).get_update()
+        assert identifier.endswith(CANVAS)
+        self.canvas_reads += 1
+        return self.canvas.get_update()
+
+
+def canvas_client(canvas):
+    client = RelayClient("http://127.0.0.1:1")
+    client.dm = CanvasSDK(canvas)
+    return client
+
+
+def test_foreign_canvas_schema_preserves_last_good_and_reconciles(tmp_path):
+    client = canvas_client(Doc({"nodes": Map({"n": {"id": "n", "type": "group"}})}))
+    mirror = exporter(client, tmp_path)
+    first = mirror.export()
+    receipt = (tmp_path / "current.json").read_bytes()
+    state = (tmp_path / "state.json").read_bytes()
+    first_body = tmp_path / "generations" / first["revision"] / "eng-relay/diagram.canvas"
+    accepted = first_body.read_bytes()
+    for invalid in (
+        Doc({"contents": Text("foreign Markdown")}),
+        Doc({"filemeta_v0": Map({"x": {"id": NOTE}})}),
+        Doc({"unrelated": Map({"value": 1})}),
+        Doc(),
+    ):
+        client.dm.canvas = invalid
+        with pytest.raises(DeferredExport):
+            mirror.export()
+        assert (tmp_path / "current.json").read_bytes() == receipt
+        assert (tmp_path / "state.json").read_bytes() == state
+        assert first_body.read_bytes() == accepted
+    client.dm.canvas = Doc({"relay": Map({"v": 0})})
+    recovered = mirror.export()
+    assert recovered["revision"] != first["revision"]
+    assert json.loads(
+        (tmp_path / "generations" / recovered["revision"] / "eng-relay/diagram.canvas").read_text()
+    ) == {"nodes": [], "edges": []}
+
+
+@pytest.mark.parametrize("shape", ["header", "nodes", "edges", "deleted-nodes", "deleted-edges"])
+def test_canvas_enrollment_sparse_maps_and_deleted_history_are_authoritative(tmp_path, shape):
+    if shape == "header":
+        canvas = Doc({"relay": Map({"v": 0})})
+    else:
+        key = "nodes" if "nodes" in shape else "edges"
+        canvas = Doc({key: Map({"n": {"id": "n", "type": "group"}})})
+        if shape.startswith("deleted"):
+            del canvas.get(key, type=Map)["n"]
+    client = canvas_client(canvas)
+    receipt = exporter(client, tmp_path).export()
+    result = json.loads(
+        (tmp_path / "generations" / receipt["revision"] / "eng-relay/diagram.canvas").read_text()
+    )
+    expected = {"nodes": [], "edges": []}
+    if shape in ("nodes", "edges"):
+        expected[shape] = [{"id": "n", "type": "group"}]
+    assert result == expected
+    assert client.dm.canvas_reads == 1, "validation and decoding must use the same fetched document"
 
 
 class FakeClient:

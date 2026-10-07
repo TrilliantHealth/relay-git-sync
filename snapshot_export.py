@@ -19,8 +19,10 @@ import threading
 import uuid
 from pathlib import Path, PurePosixPath
 
+from pycrdt import Map
+
 from models import create_document_resource_from_metadata
-from relay_client import RelayClient
+from relay_client import RelayClient, is_unsynced_ydoc
 from s3rn import S3RemoteCanvas, S3RemoteDocument, S3RemoteFolder
 from snapshot_budget import StorageBudget, StorageRefused
 
@@ -85,6 +87,20 @@ class SnapshotExporter:
             raise DeferredExport("folder has not been uploaded")
         return parsed["filemeta"]
 
+    def _canvas_content(self, resource):
+        doc, _ = self.client.get_document_structure(resource)
+        if is_unsynced_ydoc(doc):
+            raise DeferredExport("canvas has not been uploaded")
+        keys = set(doc.keys())
+        if keys & {"contents", "filemeta_v0"}:
+            raise DeferredExport("canvas document has a foreign schema")
+        # Relay enrollment writes relay.v=0 even for an empty canvas. Lazy
+        # nodes/edges maps need not encode until written; tombstones retain history.
+        enrolled = "relay" in keys and doc.get("relay", type=Map).get("v") == 0
+        if not enrolled and not keys & {"nodes", "edges"}:
+            raise DeferredExport("canvas document has no canvas schema evidence")
+        return json.dumps(self.client._export_canvas_data(doc), indent=2, sort_keys=True)
+
     def export(self):
         with (self.root / "export.lock").open("w") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
@@ -132,8 +148,7 @@ class SnapshotExporter:
                     body = self.client.fetch_document_content(resource)
                     content = None if body is None else body.encode("utf-8")
                 elif isinstance(resource, S3RemoteCanvas):
-                    body = self.client.fetch_canvas_content(resource)
-                    content = None if body is None else body.encode("utf-8")
+                    content = self._canvas_content(resource).encode("utf-8")
                 else:
                     expected = entry.get("hash")
                     if not isinstance(expected, str) or len(expected) != 64:
