@@ -160,9 +160,12 @@ class OperationsQueue:
         # resets: a commit of unrelated work returns True and clears the flag
         # while young unpaired deletions are still being held back, and with
         # no later events the deferrals would otherwise never be released.
+        # has_failed_pushes does the same for a push that failed after its
+        # commit was made, so the backlog goes out without another edit.
         if not (
             self.sync_state.has_changes
             or self.sync_engine.persistence_manager.deferred_deletions_pending
+            or self.sync_engine.persistence_manager.has_failed_pushes
         ):
             return
 
