@@ -52,6 +52,7 @@ def test_foreign_canvas_schema_preserves_last_good_and_reconciles(tmp_path):
     accepted = first_body.read_bytes()
     for invalid in (
         Doc({"contents": Text("foreign Markdown")}),
+        Doc({"relay": Map({"v": 0}), "contents": Text("foreign Markdown")}),
         Doc({"filemeta_v0": Map({"x": {"id": NOTE}})}),
         Doc({"unrelated": Map({"value": 1})}),
         Doc(),
@@ -89,6 +90,32 @@ def test_canvas_enrollment_sparse_maps_and_deleted_history_are_authoritative(tmp
         expected[shape] = [{"id": "n", "type": "group"}]
     assert result == expected
     assert client.dm.canvas_reads == 1, "validation and decoding must use the same fetched document"
+
+
+@pytest.mark.parametrize("node_id", ["contents", "filemeta_v0", "arbitrary-text-root"])
+@pytest.mark.parametrize("deleted", [False, True])
+def test_canvas_text_node_root_names_and_tombstones_are_not_foreign_schema(
+    tmp_path, node_id, deleted
+):
+    canvas = Doc(
+        {
+            "relay": Map({"v": 0}),
+            "nodes": Map({node_id: {"id": node_id, "type": "text"}}),
+            node_id: Text("legitimate canvas text"),
+        }
+    )
+    if deleted:
+        del canvas.get("nodes", type=Map)[node_id]
+    client = canvas_client(canvas)
+    receipt = exporter(client, tmp_path).export()
+    result = json.loads(
+        (tmp_path / "generations" / receipt["revision"] / "eng-relay/diagram.canvas").read_text()
+    )
+    expected = (
+        [] if deleted else [{"id": node_id, "type": "text", "text": "legitimate canvas text"}]
+    )
+    assert result == {"nodes": expected, "edges": []}
+    assert client.dm.canvas_reads == 1
 
 
 class FakeClient:

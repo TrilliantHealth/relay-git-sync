@@ -88,17 +88,17 @@ class SnapshotExporter:
         return parsed["filemeta"]
 
     def _canvas_content(self, resource):
-        doc, _ = self.client.get_document_structure(resource)
+        doc = self.client.get_doc_object(resource)
         if is_unsynced_ydoc(doc):
             raise DeferredExport("canvas has not been uploaded")
         keys = set(doc.keys())
-        if keys & {"contents", "filemeta_v0"}:
-            raise DeferredExport("canvas document has a foreign schema")
         # Relay enrollment writes relay.v=0 even for an empty canvas. Lazy
         # nodes/edges maps need not encode until written; tombstones retain history.
-        enrolled = "relay" in keys and doc.get("relay", type=Map).get("v") == 0
-        if not enrolled and not keys & {"nodes", "edges"}:
-            raise DeferredExport("canvas document has no canvas schema evidence")
+        # Text-node IDs name arbitrary root texts, including contents/filemeta_v0.
+        if not keys & {"nodes", "edges"}:
+            enrolled = "relay" in keys and doc.get("relay", type=Map).get("v") == 0
+            if not enrolled or keys & {"contents", "filemeta_v0"}:
+                raise DeferredExport("canvas document has no canvas schema evidence")
         return json.dumps(self.client._export_canvas_data(doc), indent=2, sort_keys=True)
 
     def export(self):
