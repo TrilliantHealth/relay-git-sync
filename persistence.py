@@ -170,7 +170,8 @@ class PersistenceManager:
     MIRROR_BASE_DIR = "repos"
     LOCAL_STATE_FILE = "local_state.json"
     UNPUSHED_CHECK_FETCH_INTERVAL_SECONDS = 300
-    STALLED_PUSH_WARNING_SECONDS = 30 * 60
+    STALLED_PUSH_WARNING_SECONDS = int(os.getenv("RELAY_GIT_STALLED_PUSH_WARNING_SECONDS", "300"))
+    STALLED_PUSH_ERROR_SECONDS = int(os.getenv("RELAY_GIT_STALLED_PUSH_ERROR_SECONDS", "1800"))
     PUSH_RETRY_INTERVAL_SECONDS = 60
 
     def __init__(self, data_dir: str = ".", git_config_file: Optional[str] = None):
@@ -1153,8 +1154,10 @@ class PersistenceManager:
                         print(f"Git commit for repository {repo_key}: {commit_msg}")
                         committed_any = True
 
-                    # Push to remote if configured
-                    self._push_to_remote(repo_key, git_repo)
+                    # Push to remote if configured. While a push is failing, new
+                    # commits wait for the next retry rather than each trying again.
+                    if not self._push_retry_too_soon(repo_key):
+                        self._push_to_remote(repo_key, git_repo)
 
                 elif git_repo.remotes and not self._push_retry_too_soon(repo_key):
                     if self._has_unpushed_commits(repo_key, git_repo):
@@ -1525,11 +1528,14 @@ class PersistenceManager:
             return
 
         age_seconds = time.time() - min(int(t) for t in commit_times)
-        if age_seconds >= self.STALLED_PUSH_WARNING_SECONDS:
-            logger.warning(
-                f"Push stalled for {repo_key}: {len(commit_times)} commits unpushed, "
-                f"oldest from {int(age_seconds // 60)} minutes ago"
+        backlog = f"{len(commit_times)} commits unpushed, oldest from {int(age_seconds // 60)} minutes ago"
+        if age_seconds >= self.STALLED_PUSH_ERROR_SECONDS:
+            logger.error(
+                f"Push stalled over {self.STALLED_PUSH_ERROR_SECONDS // 60} minutes "
+                f"for {repo_key}: {backlog}"
             )
+        elif age_seconds >= self.STALLED_PUSH_WARNING_SECONDS:
+            logger.warning(f"Push stalled for {repo_key}: {backlog}")
 
     def _record_push_failure(self, repo_key: str, git_repo: git.Repo):
         self._failed_push_times[repo_key] = time.monotonic()
