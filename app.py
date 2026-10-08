@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import json
 import logging
 import os
 
@@ -89,6 +90,7 @@ def run_server(
     git_config_file=None,
     websocket_reconnect_delay=5.0,
     relay_id: str = "",
+    folder_tokens=None,
 ):
     if not relay_id:
         raise ValueError("Relay ID is required")
@@ -116,7 +118,11 @@ def run_server(
 
     try:
         # Initialize components
-        relay_client = RelayClient(relay_server_url, relay_server_api_key)
+        relay_client = RelayClient(relay_server_url, relay_server_api_key, folder_tokens)
+        if folder_tokens:
+            print(
+                f"Reading documents with folder-channel tokens for {len(folder_tokens)} folder(s)"
+            )
         persistence_manager = PersistenceManager(data_dir, git_config_file)
         authors = attribution.parse_authors(persistence_manager.git_config.authors)
         if authors:
@@ -237,6 +243,13 @@ if __name__ == "__main__":
         exit(1)
 
     relay_server_api_key = os.getenv("RELAY_SERVER_API_KEY")
+    try:
+        folder_tokens = json.loads(os.getenv("RELAY_FOLDER_TOKENS") or "{}")
+        if not isinstance(folder_tokens, dict):
+            raise ValueError("expected a JSON object of folder ID to token")
+    except ValueError as e:
+        print(f"Error: RELAY_FOLDER_TOKENS is not valid: {e}")
+        exit(1)
 
     if not relay_server_api_key:
         # Setup mode: print auth setup instructions and exit cleanly. A nonzero
@@ -273,4 +286,5 @@ if __name__ == "__main__":
         args.config,
         args.websocket_reconnect_delay,
         relay_id=args.relay_id,
+        folder_tokens=folder_tokens,
     )
