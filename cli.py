@@ -245,10 +245,22 @@ def setup_command(args):
             )
             return 1
 
+        folder_ids = None
+        if args.folder_channels:
+            config_file = args.config or os.path.join(args.data_dir, "git_connectors.toml")
+            folder_ids = [
+                connector.shared_folder_id
+                for connector in GitConnectorConfig(config_file).get_connectors_for_relay(relay_id)
+            ]
+            if not folder_ids:
+                print("Error: --folder-channels needs [[git_connector]] entries for this relay.")
+                return 1
+
         setup = generate_setup(
             server_url=server_url.rstrip("/"),
             relay_id=relay_id,
             expires_days=args.expires_days,
+            folder_ids=folder_ids,
             webhook_url=resolve_webhook_url(
                 args.webhook_url,
                 data_dir=args.data_dir,
@@ -580,6 +592,15 @@ Git Connectors:
         help="Public Git Sync webhook endpoint URL (overrides [webhook].url)",
     )
     setup_parser.add_argument("--expires-days", type=int, help="API key lifetime in days")
+    setup_parser.add_argument(
+        "--folder-channels",
+        action="store_true",
+        help=(
+            "Also mint one key per configured shared folder carrying that folder's routing "
+            "channel (RELAY_FOLDER_TOKENS), so documents Git Sync loads stay routed to "
+            "their folder"
+        ),
+    )
     setup_parser.add_argument("--json", action="store_true", help="Print JSON")
     setup_parser.set_defaults(func=setup_command)
 
