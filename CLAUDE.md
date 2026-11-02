@@ -10,10 +10,14 @@ This is a real-time synchronization bridge between Relay Server collaborative do
 
 Any change to sync behavior must preserve these repository-level invariants:
 
-1. **Absent evidence means preserve, never trash.** The absence of a filemeta
-   entry in one snapshot is not proof of deletion. Deletion bursts above
-   `max(10% of membership, 25)` are gated, not applied
-   (`RELAY_GIT_ALLOW_MASS_DELETE=1` releases a gate after review).
+1. **The mirror follows Relay's deletions and reports bursts.** The mirror
+   cannot stop a deletion from reaching Relay; the plugin's DeleteCollector
+   does that on each client. Holding a burst back only left the mirror's
+   folder map stale, misfiling edits to moved documents. Deletion bursts above
+   `max(10% of membership, 25)` are applied after the working tree, uncommitted
+   content included, is committed to a `refs/mass-deletions/` ref that is
+   pushed, and retried each minute until a remote accepts it. One
+   `Mass deletion applied` error names the ref and whether it was pushed.
 2. **An empty state vector means unsynced, not empty.** A Y-Doc that decodes
    to zero clients was never written: the server has the guid registered but
    no content was uploaded yet. Fetches defer; they never wipe files.
