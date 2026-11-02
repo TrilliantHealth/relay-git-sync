@@ -42,12 +42,6 @@ def mass_change_threshold(membership_size: int) -> int:
     return max(int(MASS_CHANGE_THRESHOLD_FRACTION * membership_size), MASS_CHANGE_THRESHOLD_FLOOR)
 
 
-def allow_mass_delete() -> bool:
-    """Operator override releasing a gated deletion burst, the mirror analog
-    of the plugin's explicit send-held-deletions user decision."""
-    return os.getenv("RELAY_GIT_ALLOW_MASS_DELETE") == "1"
-
-
 class SyncEngine:
     """Core synchronization logic for Relay documents to Git repositories"""
 
@@ -144,7 +138,7 @@ class SyncEngine:
                 else:
                     logger.warning(
                         "Preserving prior filemeta for folder %s because the remote "
-                        "snapshot was gated",
+                        "snapshot was refused",
                         resource_id,
                     )
 
@@ -315,7 +309,7 @@ class SyncEngine:
                 else:
                     logger.warning(
                         "Preserving prior filemeta for folder %s because the remote "
-                        "snapshot was gated",
+                        "snapshot was refused",
                         folder_uuid,
                     )
 
@@ -561,20 +555,34 @@ class SyncEngine:
                     relay_id, folder_resource, new_filemeta, remote_paths, diff_log
                 )
 
-                # Gate deletion bursts (DeleteCollector analog): absence from
-                # one filemeta snapshot is weak evidence, so a burst above the
-                # threshold is held instead of applied.
+                # The mirror cannot stop a deletion from reaching Relay, and
+                # git history keeps every deleted file, so a burst is applied
+                # and reported rather than held.
                 delete_threshold = mass_change_threshold(membership_size)
-                filemeta_accepted = True
-                if len(deletes) > delete_threshold and not allow_mass_delete():
-                    logger.error(
-                        f"Gating deletion burst for folder {folder_uuid}: {len(deletes)} "
-                        f"deletions exceeds threshold {delete_threshold} for membership "
-                        f"of {membership_size}. No files deleted. Set "
-                        f"RELAY_GIT_ALLOW_MASS_DELETE=1 and re-sync to apply."
+                if len(deletes) > delete_threshold:
+                    snapshot = self.persistence_manager.snapshot_before_deletion(
+                        relay_id,
+                        folder_uuid,
+                        f"Snapshot before {len(deletes)} deletions in folder {folder_uuid}",
                     )
-                    deletes = []
-                    filemeta_accepted = False
+                    restore_point = (
+                        f"commit {snapshot[0][:10]} (ref {snapshot[1]}"
+                        + (
+                            ""
+                            if snapshot[2]
+                            else ", NOT yet pushed: retried every minute, lost if the pod "
+                            "restarts first"
+                        )
+                        + f"); restore with `git fetch origin {snapshot[1]} && "
+                        f"git checkout FETCH_HEAD -- <paths>`"
+                        if snapshot
+                        else "no snapshot (folder has no repository)"
+                    )
+                    logger.error(
+                        f"Mass deletion applied for folder {folder_uuid}: {len(deletes)} "
+                        f"deletions exceed threshold {delete_threshold} for membership of "
+                        f"{membership_size}. Every deleted file is in {restore_point}."
+                    )
                 operations.extend(deletes)
 
                 # Execute all operations
@@ -588,7 +596,7 @@ class SyncEngine:
                     for log_entry in diff_log:
                         print(f"  {log_entry}")
 
-                return operations, filemeta_accepted
+                return operations, True
 
             except Exception as e:
                 logger.error(f"Error syncing folder {folder_uuid}: {e}")

@@ -65,7 +65,7 @@ def test_sync_relay_all_folders_uses_configured_connectors():
     assert request.resource.folder_id == "configured-folder"
 
 
-def test_gated_folder_snapshot_preserves_prior_filemeta():
+def test_refused_folder_snapshot_preserves_prior_filemeta():
     engine = make_engine()
     old_filemeta = {"/existing.md": {"id": "existing-doc", "type": "markdown"}}
     engine.persistence_manager.filemeta_folders = {"relay": {"folder": old_filemeta}}

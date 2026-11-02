@@ -207,6 +207,9 @@ class PersistenceManager:
         # Last fetch time per repo for the unpushed-commit check, keyed by repo_key
         self._unpushed_check_fetch_times: Dict[str, float] = {}
         self._failed_push_times: Dict[str, float] = {}  # repo_key -> monotonic time
+        # repo_key -> mass-deletion snapshot refs no remote has accepted yet
+        self._unpushed_snapshot_refs: Dict[str, List[str]] = {}
+        self._snapshot_push_attempts: Dict[str, float] = {}  # repo_key -> monotonic time
 
         # Initialize git connector configuration first to get known hosts
         config_path = default_git_config_file(self.data_dir, git_config_file)
@@ -1099,6 +1102,8 @@ class PersistenceManager:
                     logger.info(f"Skipping commit for unconfigured repository {repo_key}")
                     continue
 
+                self._retry_snapshot_pushes(repo_key, git_repo)
+
                 self._ensure_configured_branch(repo_key, git_repo)
 
                 if git_repo.is_dirty() or git_repo.untracked_files:
@@ -1502,7 +1507,7 @@ class PersistenceManager:
     @property
     def has_failed_pushes(self) -> bool:
         """True while any repo's last push failed, so the commit timer keeps retrying it."""
-        return bool(self._failed_push_times)
+        return bool(self._failed_push_times or self._unpushed_snapshot_refs)
 
     def _push_retry_too_soon(self, repo_key: str) -> bool:
         failed_at = self._failed_push_times.get(repo_key)
@@ -1632,6 +1637,92 @@ class PersistenceManager:
         """Get git repository for a folder within a relay"""
         repo_key = f"{relay_id}/{folder_id}"
         return self.git_repos.get(repo_key)
+
+    def snapshot_before_deletion(
+        self, relay_id: str, folder_id: str, message: str
+    ) -> Optional[Tuple[str, str, bool]]:
+        """Commit the folder's working tree to a ref outside the synced branch and push it.
+
+        Files are written as soon as they sync but committed on a timer, so a
+        file deleted soon after it changed may hold content no commit has. The
+        snapshot keeps that content without touching the branch, the real
+        index or per-author attribution. Returns the snapshot commit, its ref,
+        and whether the remote accepted it; a ref it did not accept is retried.
+        """
+        repo_key = f"{relay_id}/{folder_id}"
+        git_repo = self.git_repos.get(repo_key)
+        if git_repo is None:
+            return None
+
+        index_path = os.path.join(git_repo.git_dir, "mass-deletion-snapshot-index")
+        identity = git.Actor.committer(git_repo.config_reader())
+        env = {
+            "GIT_INDEX_FILE": index_path,
+            "GIT_AUTHOR_NAME": identity.name,
+            "GIT_AUTHOR_EMAIL": identity.email,
+            "GIT_COMMITTER_NAME": identity.name,
+            "GIT_COMMITTER_EMAIL": identity.email,
+        }
+
+        def snapshot() -> str:
+            try:
+                has_head = git_repo.head.is_valid()
+                if has_head:
+                    git_repo.git.read_tree("HEAD", env=env)
+                git_repo.git.add("-A", env=env)
+                tree = git_repo.git.write_tree(env=env)
+                parents = ["-p", "HEAD"] if has_head else []
+                return git_repo.git.commit_tree(tree, *parents, "-m", message, env=env)
+            finally:
+                if os.path.exists(index_path):
+                    os.remove(index_path)
+
+        commit = self._safe_git_operation(snapshot)
+        ref = f"refs/mass-deletions/{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{commit[:10]}"
+        self._safe_git_operation(lambda: git_repo.git.update_ref(ref, commit))
+        self._unpushed_snapshot_refs.setdefault(repo_key, []).append(ref)
+        self._push_snapshot_refs(repo_key, git_repo)
+        return commit, ref, ref not in self._unpushed_snapshot_refs.get(repo_key, [])
+
+    def _push_snapshot_refs(self, repo_key: str, git_repo: git.Repo):
+        """Push pending snapshot refs; a ref that fails stays pending for the next retry.
+
+        Until a remote has a snapshot, a restart loses it with the pod's storage.
+        """
+        self._snapshot_push_attempts[repo_key] = time.monotonic()
+        if not git_repo.remotes:
+            return
+
+        remote = (
+            git_repo.remotes.origin
+            if "origin" in [r.name for r in git_repo.remotes]
+            else git_repo.remotes[0]
+        )
+        pending = []
+        for ref in self._unpushed_snapshot_refs.get(repo_key, []):
+            try:
+                self._safe_git_operation(lambda: git_repo.git.push(remote.name, f"{ref}:{ref}"))
+                print(f"Git push for repository {repo_key}: mass-deletion snapshot {ref}")
+            except git.exc.GitCommandError as e:
+                logger.error(
+                    f"Snapshot push failed for repository {repo_key}, retrying in "
+                    f"{self.PUSH_RETRY_INTERVAL_SECONDS}s: {ref}: {self._push_error_reason(e)}"
+                )
+                pending.append(ref)
+        if pending:
+            self._unpushed_snapshot_refs[repo_key] = pending
+        else:
+            self._unpushed_snapshot_refs.pop(repo_key, None)
+
+    def _retry_snapshot_pushes(self, repo_key: str, git_repo: git.Repo):
+        if repo_key not in self._unpushed_snapshot_refs:
+            return
+
+        last_attempt = self._snapshot_push_attempts.get(repo_key, 0.0)
+        if time.monotonic() - last_attempt < self.PUSH_RETRY_INTERVAL_SECONDS:
+            return
+
+        self._push_snapshot_refs(repo_key, git_repo)
 
     def _sanitize_path(self, path: str, base_directory: str) -> str:
         """

@@ -2,16 +2,18 @@
 
 See CLAUDE.md "Data-Safety Invariants". The scenarios here reproduce the
 mass-wipe incident class: unsynced docs served as empty, publication/reset
-states misread as deletions, and destructive bursts applied without a gate.
+states misread as deletions, and destructive bursts applied without notice.
 """
 
 import os
 from unittest.mock import Mock
 
+import git
 import pytest
 from pycrdt import Doc, Text
 
 from models import OperationType, SyncOperation
+from persistence import PersistenceManager
 from relay_client import RelayClient
 from s3rn import S3RemoteDocument, S3RemoteFolder
 from sync_engine import EMPTY_CANVAS_CONTENT, SyncEngine, mass_change_threshold
@@ -52,9 +54,21 @@ class FakePersistence:
         self.local_file_state = {}
         self.deleted_paths = []
         self.written = []
+        self.git_repos = {}
+        self._unpushed_snapshot_refs = {}
+        self._snapshot_push_attempts = {}
 
     def get_folder_path_with_prefix(self, relay_id, folder_uuid):
         return os.path.join(self.base_dir, relay_id, folder_uuid)
+
+    PUSH_RETRY_INTERVAL_SECONDS = PersistenceManager.PUSH_RETRY_INTERVAL_SECONDS
+    snapshot_before_deletion = PersistenceManager.snapshot_before_deletion
+    _push_snapshot_refs = PersistenceManager._push_snapshot_refs
+    _retry_snapshot_pushes = PersistenceManager._retry_snapshot_pushes
+    _push_error_reason = staticmethod(PersistenceManager._push_error_reason)
+
+    def _safe_git_operation(self, func):
+        return func()
 
     def _sanitize_path(self, path, folder_path):
         return os.path.join(folder_path, path.lstrip("/"))
@@ -162,19 +176,75 @@ class TestPublicationRule:
         assert len(os.listdir(folder_dir(engine))) == 5
 
 
-class TestDeletionBurstGate:
-    def test_burst_above_threshold_is_gated(self, engine):
+class TestDeletionBurst:
+    def test_burst_above_threshold_applies_and_alerts(self, engine, caplog):
         seed_files(engine, 100)
         kept = doc_filemeta(["/note-000.md", "/note-001.md"])
+        engine.relay_client = make_relay_client(emptied_doc_update())
 
         engine.apply_remote_folder_changes(
             RELAY_ID, S3RemoteFolder(RELAY_ID, FOLDER_ID), old_filemeta={}, new_filemeta=kept
         )
 
-        # 98 pending deletions > max(0.1 * 2, 25) = 25: all gated.
-        assert engine.persistence_manager.deleted_paths == []
+        assert len(engine.persistence_manager.deleted_paths) == 98
+        alerts = [r for r in caplog.records if "Mass deletion applied" in r.getMessage()]
+        assert len(alerts) == 1
+        assert "98 deletions exceed threshold 25" in alerts[0].getMessage()
 
-    def test_burst_below_threshold_applies(self, engine):
+    def test_burst_snapshot_keeps_uncommitted_content(self, engine, caplog):
+        base = folder_dir(engine)
+        repo = git.Repo.init(base)
+        with open(os.path.join(base, "note-099.md"), "w") as f:
+            f.write("committed content")
+        repo.index.add(["note-099.md"])
+        branch_head = repo.index.commit("initial").hexsha
+        seed_files(engine, 100, content="uncommitted content")
+        engine.persistence_manager.git_repos[f"{RELAY_ID}/{FOLDER_ID}"] = repo
+        kept = doc_filemeta(["/note-000.md", "/note-001.md"])
+        engine.relay_client = make_relay_client(emptied_doc_update())
+
+        engine.apply_remote_folder_changes(
+            RELAY_ID, S3RemoteFolder(RELAY_ID, FOLDER_ID), old_filemeta={}, new_filemeta=kept
+        )
+
+        assert len(engine.persistence_manager.deleted_paths) == 98
+        assert repo.head.commit.hexsha == branch_head
+        (ref,) = [r for r in repo.refs if r.path.startswith("refs/mass-deletions/")]
+        alert = next(r.getMessage() for r in caplog.records if "Mass deletion" in r.getMessage())
+        assert ref.path in alert
+        for name in ("note-050.md", "note-099.md"):
+            assert repo.git.show(f"{ref.path}:{name}") == "uncommitted content"
+
+    def test_rejected_snapshot_push_is_retried(self, engine, caplog, tmp_path):
+        remote = git.Repo.init(tmp_path / "remote.git", bare=True)
+        hook = tmp_path / "remote.git" / "hooks" / "pre-receive"
+        hook.write_text("#!/bin/sh\nexit 1\n")
+        hook.chmod(0o755)
+        base = folder_dir(engine)
+        repo = git.Repo.init(base)
+        repo.create_remote("origin", str(tmp_path / "remote.git"))
+        seed_files(engine, 100, content="uncommitted content")
+        engine.persistence_manager.git_repos[f"{RELAY_ID}/{FOLDER_ID}"] = repo
+        kept = doc_filemeta(["/note-000.md", "/note-001.md"])
+        engine.relay_client = make_relay_client(emptied_doc_update())
+
+        engine.apply_remote_folder_changes(
+            RELAY_ID, S3RemoteFolder(RELAY_ID, FOLDER_ID), old_filemeta={}, new_filemeta=kept
+        )
+
+        alert = next(r.getMessage() for r in caplog.records if "Mass deletion" in r.getMessage())
+        assert "NOT yet pushed" in alert
+        assert not [r for r in remote.refs if r.path.startswith("refs/mass-deletions/")]
+
+        hook.unlink()
+        engine.persistence_manager._snapshot_push_attempts.clear()
+        engine.persistence_manager._retry_snapshot_pushes(f"{RELAY_ID}/{FOLDER_ID}", repo)
+
+        (ref,) = [r for r in remote.refs if r.path.startswith("refs/mass-deletions/")]
+        assert remote.git.show(f"{ref.path}:note-050.md") == "uncommitted content"
+        assert engine.persistence_manager._unpushed_snapshot_refs == {}
+
+    def test_burst_below_threshold_applies_quietly(self, engine, caplog):
         paths = seed_files(engine, 30)
         kept = doc_filemeta(paths[:28])
         engine.relay_client = make_relay_client(emptied_doc_update())
@@ -183,23 +253,11 @@ class TestDeletionBurstGate:
             RELAY_ID, S3RemoteFolder(RELAY_ID, FOLDER_ID), old_filemeta={}, new_filemeta=kept
         )
 
-        # 2 deletions <= max(0.1 * 28, 25) = 25: applied.
         assert sorted(engine.persistence_manager.deleted_paths) == [
             "note-028.md",
             "note-029.md",
         ]
-
-    def test_override_env_releases_gate(self, engine, monkeypatch):
-        monkeypatch.setenv("RELAY_GIT_ALLOW_MASS_DELETE", "1")
-        seed_files(engine, 100)
-        kept = doc_filemeta(["/note-000.md"])
-        engine.relay_client = make_relay_client(emptied_doc_update())
-
-        engine.apply_remote_folder_changes(
-            RELAY_ID, S3RemoteFolder(RELAY_ID, FOLDER_ID), old_filemeta={}, new_filemeta=kept
-        )
-
-        assert len(engine.persistence_manager.deleted_paths) == 99
+        assert not any("Mass deletion" in r.getMessage() for r in caplog.records)
 
 
 class TestTruncationBurstGate:
