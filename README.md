@@ -108,9 +108,40 @@ The setup output gives you:
 - a `[[auth]]` block for Relay Server `relay.toml`
 - a `RELAY_SERVER_API_KEY` value for Git Sync
 - if `[webhook].url` is configured, a `[[webhooks]]` block and `WEBHOOK_SECRET`
+- with `--folder-channels`, a `RELAY_FOLDER_TOKENS` value (see below)
 
-Runtime API keys are only read from `RELAY_SERVER_API_KEY`; do not pass them as command
-arguments when running the server or sync command.
+Runtime API keys are only read from `RELAY_SERVER_API_KEY` and `RELAY_FOLDER_TOKENS`; do
+not pass them as command arguments when running the server or sync command.
+
+#### Folder-channel read keys
+
+Relay Server fixes a document's routing channel when it first loads the document into
+memory, taking the channel from the key of the request that loaded it. A document first
+loaded by a key with no channel routes its events to itself. Until the server unloads it,
+about two checkpoint intervals after its last use, its edits reach no folder subscriber:
+not this Git Sync, nor any other. `RELAY_SERVER_API_KEY` carries no channel, so a note
+whose first load is one of Git Sync's own reads can lose the edits made while it stays
+loaded.
+
+`uv run git-sync generate-auth --folder-channels` also mints, from the same key pair and
+with the same read-only prefix scope, one key per configured shared folder whose channel
+is that folder, and prints them as `RELAY_FOLDER_TOKENS` (a JSON object of folder ID to
+key). With it set, Git Sync reads each folder's notes and canvases with that folder's key,
+so documents its reads load stay routed to their folder. Folder documents, file downloads
+and every other request still use `RELAY_SERVER_API_KEY`, as does any folder without a
+key. Without `RELAY_FOLDER_TOKENS`, nothing changes.
+
+Limits: the keys cover only Git Sync's document reads. Relay Server's
+`/d/:doc/attributed-content`, which per-author commits (`[authors]`) call, always loads
+without a channel. A document already loaded without one is not re-routed by a later
+read with a key.
+
+`tests/repro/folder_channel_routing.py` reproduces the loss and the fix with a real
+relay-server binary and two Git Sync processes:
+
+```bash
+RELAY_BIN=/path/to/relay uv run python tests/repro/folder_channel_routing.py
+```
 
 API keys do not expire unless you pass `--expires-days`.
 Use `--json` for machine-readable output.
