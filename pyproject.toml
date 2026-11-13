@@ -41,6 +41,7 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools]
 py-modules = [
     "app",
+    "attribution",
     "auth_middleware",
     "cli",
     "git_config",
